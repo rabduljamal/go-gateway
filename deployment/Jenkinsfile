@@ -1,0 +1,164 @@
+def ImageBuild
+
+def cancelPreviousBuilds() {
+    def jobName = env.JOB_NAME
+    def buildNumber = env.BUILD_NUMBER.toInteger()
+
+    def currentJob = Jenkins.instance.getItemByFullName(jobName)
+
+    for (def build : currentJob.builds) {
+        def listener = build.getListener()
+        def exec = build.getExecutor()
+        if (build.isBuilding() && build.number.toInteger() < buildNumber && exec != null) {
+            exec.interrupt(
+                    Result.ABORTED,
+                    new CauseOfInterruption.UserInterruption("Aborted by #${currentBuild.number}")
+                )
+            println("Aborted previously running build #${build.number}")
+        }
+    }
+}
+
+pipeline { 
+    agent any
+
+    tools {
+        go "go21"
+        nodejs "nodejs20"
+    }  
+
+    environment {
+        REPO_NAME="gateway-snip"
+        DB_HOST=credentials("DB_HOST")
+        DB_PORT=credentials("DB_PORT")
+        DB_USER=credentials("DB_USER")
+        DB_PASSWORD=credentials("DB_PASSWORD")
+        DB_NAME=credentials("DB_NAME")
+        METABASE_SECRET_KEY=credentials("METABASE_SECRET_KEY")
+        METABASE_SITE_URL=credentials("METABASE_SITE_URL")
+    }
+
+    stages {
+        stage('SCM') {
+            when {
+                expression {
+                    env.BRANCH_NAME == 'development'
+                }
+            }
+            steps{
+                checkout scm
+                script {
+                    cancelPreviousBuilds()
+                    sh "docker rmi asset.govdt.tech/${env.REPO_NAME}:${env.BRANCH_NAME} -f"
+                }
+            }
+        }
+
+        stage('GitLeaks Scan'){
+            when {
+                expression {
+                    env.BRANCH_NAME == 'development'
+                }
+            }
+            agent {
+                docker {
+                    image 'zricethezav/gitleaks:latest'
+                    args '--entrypoint='
+                }
+            }
+
+            steps{
+                script {
+                    try {
+                        sh "gitleaks detect --source . --report-path analytics-${REPO_NAME}-repo.json -v"
+                    } catch(e) {
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis'){
+            when {
+                expression {
+                    env.BRANCH_NAME == 'development'
+                }
+            }
+            steps{
+                script {
+                    def scannerHome = tool 'sonarqube';
+                    withSonarQubeEnv() {
+                        sh "${scannerHome}/bin/sonar-scanner"
+                    }
+                }
+            }
+        }
+
+        stage('Unit Testing'){
+            when {
+                expression {
+                    env.BRANCH_NAME == 'development'
+                }
+            }
+            steps{
+                script {
+                    sh "go test ./..."
+                }
+            }
+        }
+
+        stage('Build Image Docker') { 
+            when {
+                expression {
+                    env.BRANCH_NAME == 'development'
+                }
+            }
+            steps{
+                script {
+                    def buildArgs = """\
+                    --build-arg DB_HOST="${env.DB_HOST}" \
+                    --build-arg DB_PORT="${env.DB_PORT}" \
+                    --build-arg DB_USER="${env.DB_USER}" \
+                    --build-arg DB_PASSWORD="${env.DB_PASSWORD}" \
+                    --build-arg DB_NAME="${env.DB_NAME}" \
+                    --build-arg METABASE_SECRET_KEY="${env.METABASE_SECRET_KEY}" \
+                    --build-arg METABASE_SITE_URL="${env.METABASE_SITE_URL}" \
+                    --no-cache \
+                    -f ./deployment/Dockerfile ."""
+                    
+                    echo 'Bulding docker images'
+                    ImageBuild = docker.build("${REPO_NAME}", buildArgs)
+                }
+            }
+        }
+
+        stage("Push to Registry") { 
+            when {
+                expression {
+                    env.BRANCH_NAME == 'development'
+                }
+            }
+            steps { 
+                script {
+                    docker.withRegistry('https://10.50.200.99:5000', 'docker-hub-credential') {          
+                        ImageBuild.push("${env.BRANCH_NAME}")        
+                    } 
+                }
+            }
+        }
+
+        stage("Push to Server") { 
+            when {
+                expression {
+                    env.BRANCH_NAME == 'development'
+                }
+            }
+            agent { label 'c1-support-jenkins' }
+            steps {
+                sh "kubectl apply -n ${env.BRANCH_NAME} -f ./deployment/${env.BRANCH_NAME}"
+                sh "kubectl rollout -n ${env.BRANCH_NAME} restart deploy ${REPO_NAME}"
+            }
+        }
+    }
+
+}

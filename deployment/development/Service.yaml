@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-gateway-snip
+  namespace: development
+spec:
+  type: LoadBalancer
+  selector:
+    app: gateway-snip
+  ports:
+    - protocol: TCP
+      port: 5000
+      targetPort: 8080
